@@ -23,6 +23,11 @@ static NimBLEAdvertisedDevice* g_found = nullptr;
 static NimBLEClient* g_client = nullptr;
 static NimBLERemoteCharacteristic* g_chr = nullptr;
 
+// ===== Batch buffer (8 samples per POST) =====
+static const size_t CHUNK = 8;
+static String g_buf[CHUNK];
+static size_t g_buf_count = 0;
+
 // Dump hex: useful to debug invisible/extra bytes in BLE payload
 static void dumpHex(const uint8_t* p, size_t n) {
   Serial.print("[GW] HEX: ");
@@ -43,14 +48,12 @@ static String sliceJsonObject(const uint8_t* p, size_t n) {
 
   String out;
   out.reserve((size_t)(last - first + 1));
-  for (int i = first; i <= last; i++) out += (char)p[i];
+  for (int i = first; i <= last; i++) out += (char)i[p];
   return out;
 }
 
-// Build POST body in the SAME style as the original sensor uploader:
-// Wrap a single object into an array: [ { ... } ]
-// Add api_key into the object, and remove gyro to match backend schema.
-static bool buildPostArrayFromSensorJson(const String& clean, String& outArrayJson) {
+// ====== NEW: normalize one sample (inject api_key, remove gyro) ======
+static bool normalizeOneSample(const String& clean, String& outObjJson) {
   StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, clean);
   if (err) {
@@ -59,16 +62,31 @@ static bool buildPostArrayFromSensorJson(const String& clean, String& outArrayJs
     return false;
   }
 
-  // Inject required api_key (backend requirement)
   doc["api_key"] = API_KEY;
-
-  // Remove gyro because backend does not need it (based on your backend example)
   doc.remove("gyro");
 
-  // Wrap into array
-  StaticJsonDocument<896> arr;
+  outObjJson.clear();
+  serializeJson(doc, outObjJson);
+  return true;
+}
+
+// ====== NEW: build POST array from buffer (8 objects) ======
+static bool buildPostArrayFromBuffer(String& outArrayJson) {
+  StaticJsonDocument<4096> arr; // should be enough for 8 samples
   JsonArray a = arr.to<JsonArray>();
-  a.add(doc.as<JsonObject>());
+
+  for (size_t i = 0; i < g_buf_count; i++) {
+    StaticJsonDocument<768> obj;
+    DeserializationError err = deserializeJson(obj, g_buf[i]);
+    if (err) {
+      Serial.print("[GW] buffer JSON parse failed idx=");
+      Serial.print(i);
+      Serial.print(" err=");
+      Serial.println(err.c_str());
+      return false;
+    }
+    a.add(obj.as<JsonObject>());
+  }
 
   outArrayJson.clear();
   serializeJson(arr, outArrayJson);
@@ -82,7 +100,6 @@ bool postJsonToCloud(const String& json) {
     return false;
   }
 
-  // Skip TLS cert validation during bring-up (use CA validation for production)
   s_client.setInsecure();
   s_client.setTimeout(15000);
 
@@ -156,20 +173,43 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 };
 static ScanCallbacks g_scanCb;
 
-// Start scanning for a given number of seconds
+// Start scanning for a given number of seconds (KEEP your existing behavior)
 void bleStartScan(uint32_t seconds = 5) {
   Serial.printf("[GW] BLE scanning (%us)...\n", seconds);
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&g_scanCb, false);
   scan->setInterval(45);
-  scan->setWindow(15);
+  scan->setWindow(45);     // (your current setting)
   scan->setActiveScan(true);
   scan->start(seconds, false);
 }
 
-// Connect to Sensor and obtain the target characteristic (for readValue)
+// Reset BLE state: disconnect and cleanup (KEEP)
+void bleReset() {
+  if (g_client) {
+    if (g_client->isConnected()) g_client->disconnect();
+    NimBLEDevice::deleteClient(g_client);
+  }
+  g_client = nullptr;
+  g_chr = nullptr;
+  if (g_found) { delete g_found; g_found = nullptr; }
+
+  // Make sure scan is not stuck
+  NimBLEDevice::getScan()->stop();
+  delay(50);
+}
+
+// Connect to Sensor and obtain the target characteristic (KEEP)
 bool bleConnectAndGetChar() {
   if (!g_found) return false;
+
+  // Cleanup stale client before creating a new one
+  if (g_client) {
+    if (g_client->isConnected()) g_client->disconnect();
+    NimBLEDevice::deleteClient(g_client);
+    g_client = nullptr;
+    g_chr = nullptr;
+  }
 
   Serial.println("[GW] Connecting to sensor...");
   g_client = NimBLEDevice::createClient();
@@ -208,17 +248,6 @@ bool bleConnectAndGetChar() {
   return true;
 }
 
-// Reset BLE state: disconnect and cleanup
-void bleReset() {
-  if (g_client) {
-    if (g_client->isConnected()) g_client->disconnect();
-    NimBLEDevice::deleteClient(g_client);
-  }
-  g_client = nullptr;
-  g_chr = nullptr;
-  if (g_found) { delete g_found; g_found = nullptr; }
-}
-
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -229,38 +258,42 @@ void setup() {
   NimBLEDevice::init("ELEV-GW");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  bleStartScan(5);
+  bleStartScan(2); // (your current behavior)
 }
 
 void loop() {
-  // Not connected yet: scan -> connect
+  // Not connected yet: scan -> connect (KEEP)
   if (!g_client || !g_client->isConnected() || !g_chr) {
     if (g_found) bleConnectAndGetChar();
     else bleStartScan(5);
+    delay(50);
+    return;
+  }
+
+  // Connected: read value written by Sensor (KEEP)
+  std::string v;
+  try {
+    v = g_chr->readValue();
+  } catch (...) {
+    Serial.println("[GW] readValue exception -> reset BLE and rescan");
+    bleReset();
+    bleStartScan(5);
     delay(200);
     return;
   }
 
-  // Connected: read value written by Sensor
-  std::string v;
-  try { v = g_chr->readValue(); }
-  catch (...) {
-    Serial.println("[GW] readValue exception -> reset BLE");
-    bleReset();
-    delay(500);
-    return;
-  }
-
   if (v.empty()) {
-    Serial.println("[GW] BLE read empty");
-    delay(1000);
+    Serial.println("[GW] BLE read empty -> reset BLE and rescan");
+    bleReset();
+    bleStartScan(5);
+    delay(200);
     return;
   }
 
   const uint8_t* bytes = (const uint8_t*)v.data();
   size_t n = v.size();
 
-  // Print raw payload for debugging
+  // Print raw payload for debugging (KEEP)
   Serial.printf("[GW] RAW(len=%u): ", (unsigned)n);
   for (size_t i = 0; i < n; i++) {
     char c = (char)bytes[i];
@@ -271,30 +304,60 @@ void loop() {
 
   dumpHex(bytes, n);
 
-  // Clean JSON object
+  // Clean JSON object (KEEP)
   String clean = sliceJsonObject(bytes, n);
   Serial.print("[GW] CLEAN: ");
   Serial.println(clean);
 
   if (clean.length() == 0) {
     Serial.println("[GW] CLEAN empty -> skip");
-    delay(1000);
+    delay(200);
     return;
   }
 
-  // Build POST body as JSON array (original uploader style) + api_key
+  // ===== NEW: normalize + buffer (DO NOT POST immediately) =====
+  String oneObj;
+  if (!normalizeOneSample(clean, oneObj)) {
+    Serial.println("[GW] normalizeOneSample failed");
+    delay(200);
+    return;
+  }
+
+  if (g_buf_count < CHUNK) {
+    g_buf[g_buf_count++] = oneObj;
+  } else {
+    // Should not happen, but keep safe: overwrite oldest (optional)
+    g_buf_count = 0;
+    g_buf[g_buf_count++] = oneObj;
+  }
+
+  Serial.print("[GW] buffered samples=");
+  Serial.println(g_buf_count);
+
+  // If not yet 8 samples, return
+  if (g_buf_count < CHUNK) {
+    delay(50);
+    return;
+  }
+
+  // Build POST body: JSON array of 8 objects
   String postBody;
-  if (!buildPostArrayFromSensorJson(clean, postBody)) {
-    Serial.println("[GW] buildPostArrayFromSensorJson failed");
-    delay(1000);
+  if (!buildPostArrayFromBuffer(postBody)) {
+    Serial.println("[GW] buildPostArrayFromBuffer failed (keep buffer and retry)");
+    delay(200);
     return;
   }
 
-  Serial.print("[GW] POST_ARRAY: ");
+  Serial.print("[GW] POST_ARRAY(8): ");
   Serial.println(postBody);
 
-  // Forward to Railway
-  postJsonToCloud(postBody);
+  // POST; success -> clear buffer; fail -> keep buffer for retry
+  if (postJsonToCloud(postBody)) {
+    Serial.println("[GW] POST success -> clear buffer");
+    g_buf_count = 0;
+  } else {
+    Serial.println("[GW] POST failed -> keep buffer for retry");
+  }
 
-  delay(1000);
+  delay(1000); // keep your original pacing
 }
