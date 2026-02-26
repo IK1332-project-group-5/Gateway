@@ -12,17 +12,9 @@
 // =========================
 #include <NimBLEDevice.h>
 
-// BLE identity (must match Gateway)
-static const char* DEVICE_NAME = "ELEV-SENSOR";
-static NimBLEUUID SVC_UUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
-static NimBLEUUID CHR_UUID("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
-
-static NimBLEServer* server = nullptr;
-static NimBLECharacteristic* chr = nullptr;
-
-// -------------------------
-// Data structures
-// -------------------------
+// =====================================================
+// Data structures (MUST be before any function definitions)
+// =====================================================
 bool door_is_open = true;
 
 struct imu_data {
@@ -47,34 +39,96 @@ struct sensor_data {
   bool door_open;
 };
 
+// =====================================================
+// Forward declarations
+// =====================================================
+static void startAdv();
+void bleSetup();
+static bool sendPackageToGateway(const char* json, size_t len);
+
+float get_pressure();
+imu_data get_imu_data();
+
+bool pressure_change(float mu, float pressure, float gamma, float sigma_2);
+int  classify_floor(double current);
+bool magnetic_change(float mu, float magn, float gamma, float sigma_2);
+
+void output_data(float pressure, imu_data imu, bool moving_now, int current_floor, bool door_open);
+
+void sensorTask(void *parameter);
+void bleSenderTask(void *parameter);
+void advWatchdogTask(void *parameter);
+
+static bool build_single_json(const sensor_data& d, char* out, size_t out_sz);
+
+// =====================================================
+// BLE identity (must match Gateway)
+// =====================================================
+static const char* DEVICE_NAME = "ELEV-SENSOR";
+static NimBLEUUID SVC_UUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+static NimBLEUUID CHR_UUID("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+
+static NimBLEServer* server = nullptr;
+static NimBLECharacteristic* chr = nullptr;
+
+// Stronger advertising restart support
+static NimBLEAdvertising* g_adv = nullptr;
+
+// =====================================================
+// Queue & Sensors
+// =====================================================
 QueueHandle_t data_queue;
 
-// -------------------------
-// Sensors
-// -------------------------
 ICM_20948_I2C myICM;
 BMP581 pressureSensor;
 uint8_t i2cAddress = BMP581_I2C_ADDRESS_DEFAULT; // usually 0x47
 
-// -------------------------
+// =====================================================
 // BLE callbacks
-// -------------------------
+// =====================================================
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*) {
     Serial.println("[SENSOR] BLE client connected");
   }
   void onDisconnect(NimBLEServer*) {
     Serial.println("[SENSOR] BLE client disconnected -> restart advertising");
-    NimBLEDevice::startAdvertising();
+    startAdv();  // best-effort restart, watchdog will also kick
   }
 };
 
-// =========================
+// =====================================================
+// Advertising helper (compatible with your NimBLE library)
+// =====================================================
+static void startAdv() {
+  if (!g_adv) g_adv = NimBLEDevice::getAdvertising();
+
+  // Hard restart advertising (works better than startAdvertising() on some stacks)
+  g_adv->stop();
+  delay(30);
+
+  NimBLEAdvertisementData advData;
+  advData.setName(DEVICE_NAME);
+  advData.addServiceUUID(SVC_UUID);
+
+  NimBLEAdvertisementData scanData;
+  scanData.setName(DEVICE_NAME);
+
+  g_adv->setAdvertisementData(advData);
+  g_adv->setScanResponseData(scanData);
+
+  g_adv->start();
+  Serial.println("[SENSOR] Advertising (re)started");
+}
+
+// =====================================================
 // MODULE 1: BLE setup
-// =========================
+// =====================================================
 void bleSetup() {
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  // Keep BLE simple (avoid pairing/security issues)
+  NimBLEDevice::setSecurityAuth(false, false, false);
 
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCB());
@@ -82,22 +136,23 @@ void bleSetup() {
   NimBLEService* svc = server->createService(SVC_UUID);
   chr = svc->createCharacteristic(CHR_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
   chr->createDescriptor("2902");
+
   chr->setValue("{\"boot\":true}");
   svc->start();
 
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(SVC_UUID);
-  adv->start();
+  g_adv = NimBLEDevice::getAdvertising();
+  startAdv();
 
-  Serial.println("[SENSOR] BLE advertising started");
+  Serial.println("[SENSOR] BLE setup complete");
 }
 
-// =========================
+// =====================================================
 // MODULE 2: send one JSON object to Gateway via notify
-// =========================
+// =====================================================
 static bool sendPackageToGateway(const char* json, size_t len) {
   if (!chr) return false;
-  if (server && server->getConnectedCount() == 0) return false;
+  if (!server) return false;
+  if (server->getConnectedCount() == 0) return false;
 
   chr->setValue((uint8_t*)json, len);
   chr->notify();
@@ -109,9 +164,9 @@ static bool sendPackageToGateway(const char* json, size_t len) {
   return true;
 }
 
-// =========================
+// =====================================================
 // Sensor reading helpers
-// =========================
+// =====================================================
 float get_pressure() {
   bmp5_sensor_data data = {0};
   int8_t err = pressureSensor.getSensorData(&data);
@@ -142,9 +197,9 @@ imu_data get_imu_data() {
   return data;
 }
 
-// =========================
-// Your latest ML / logic (unchanged)
-// =========================
+// =====================================================
+// Logic / ML
+// =====================================================
 bool pressure_change(float mu, float pressure, float gamma, float sigma_2) {
   float change_delta = pressure - mu;
   float T = (change_delta * change_delta) / sigma_2;
@@ -183,9 +238,9 @@ bool magnetic_change(float mu, float magn, float gamma, float sigma_2) {
   return temp > gamma;
 }
 
-// =========================
+// =====================================================
 // Debug output (readable)
-// =========================
+// =====================================================
 void output_data(float pressure, imu_data imu, bool moving_now, int current_floor, bool door_open) {
   Serial.println();
   Serial.println("========== SENSOR STATUS ==========");
@@ -207,11 +262,11 @@ void output_data(float pressure, imu_data imu, bool moving_now, int current_floo
   Serial.println("==================================");
 }
 
-// =========================
+// =====================================================
 // Task 1: acquisition + inference + queue
-// =========================
+// =====================================================
 void sensorTask(void *parameter) {
-  delay(10); // needed, otherwise get_pressure may return invalid large float
+  delay(10);
 
   float pressure_mu = get_pressure();
   base = get_pressure();
@@ -247,14 +302,14 @@ void sensorTask(void *parameter) {
     door_count += magnetic_change(magnetic_mu, magn, gamma, magnetic_sigma_2);
     magnetic_mu = (1 - magnetic_delta) * magnetic_mu + magnetic_delta * magn;
 
-    if (count > 19) { // ~1 second (20 * 50ms)
+    if (count > 19) {
       count = 0;
 
       if (door_cooldown > 0) door_cooldown--;
 
       if (door_count > 2 && !moving_now && door_cooldown < 1) {
         door_is_open = !door_is_open;
-        door_cooldown = 9; // ignore triggers for ~9 seconds
+        door_cooldown = 9;
       }
       if (moving_now) {
         door_is_open = false;
@@ -263,25 +318,23 @@ void sensorTask(void *parameter) {
       output_data(pressure, imu, moving_now, current_floor, door_is_open);
       door_count = 0;
 
-      sensor_data data;
-      data.pressure_data = pressure;
-      data.accel_data_x  = imu.accel_data_x;
-      data.accel_data_y  = imu.accel_data_y;
-      data.accel_data_z  = imu.accel_data_z;
-      data.mag_data_x    = imu.mag_data_x;
-      data.mag_data_y    = imu.mag_data_y;
-      data.mag_data_z    = imu.mag_data_z;
-      data.moving        = moving_now;
-      data.floor         = current_floor;
-      data.door_open     = door_is_open;
+      sensor_data d;
+      d.pressure_data = pressure;
+      d.accel_data_x  = imu.accel_data_x;
+      d.accel_data_y  = imu.accel_data_y;
+      d.accel_data_z  = imu.accel_data_z;
+      d.mag_data_x    = imu.mag_data_x;
+      d.mag_data_y    = imu.mag_data_y;
+      d.mag_data_z    = imu.mag_data_z;
+      d.moving        = moving_now;
+      d.floor         = current_floor;
+      d.door_open     = door_is_open;
 
-      xQueueSend(data_queue, &data, portMAX_DELAY);
+      xQueueSend(data_queue, &d, portMAX_DELAY);
 
-      // update variables for moving detection
       pressure_delta = 1.0f / N_MAX;
       pressure_mu = (1 - pressure_delta) * pressure_mu + pressure_delta * pressure;
 
-      // update base when at floor 2
       if (current_floor == 2) {
         base = base - (base - pressure) / N_MAX;
       }
@@ -292,19 +345,10 @@ void sensorTask(void *parameter) {
   }
 }
 
-// =========================
+// =====================================================
 // Task 2: queue -> JSON -> BLE notify
-// =========================
+// =====================================================
 static bool build_single_json(const sensor_data& d, char* out, size_t out_sz) {
-  // Schema expected by Gateway:
-  // {
-  //   "pressure": ...,
-  //   "accel": {"x":..,"y":..,"z":..},
-  //   "mag": {"x":..,"y":..,"z":..},
-  //   "moving": 0/1,
-  //   "floor": N,
-  //   "door_open": 0/1
-  // }
   int n = snprintf(out, out_sz,
     "{"
       "\"pressure\":%.3f,"
@@ -330,7 +374,6 @@ void bleSenderTask(void *parameter) {
   static char jsonBuffer[512];
 
   while (true) {
-    // If not connected, do not drop queue data
     if (!server || server->getConnectedCount() == 0 || !chr) {
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -341,7 +384,7 @@ void bleSenderTask(void *parameter) {
         xQueueReceive(data_queue, &pending, 0);
         has_pending = true;
       } else {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(200));
         continue;
       }
     }
@@ -349,24 +392,35 @@ void bleSenderTask(void *parameter) {
     if (!build_single_json(pending, jsonBuffer, sizeof(jsonBuffer))) {
       Serial.println("[SENSOR] JSON build failed (buffer too small?)");
       has_pending = false;
-      vTaskDelay(pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
 
     bool ok = sendPackageToGateway(jsonBuffer, strlen(jsonBuffer));
-    if (ok) {
-      has_pending = false;
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    if (ok) has_pending = false;
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // 1Hz is enough and improves stability in weak-signal environments
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
-// =========================
+// =====================================================
+// NEW: Advertising watchdog
+// If link breaks without clean disconnect, this keeps advertising alive
+// =====================================================
+void advWatchdogTask(void *parameter) {
+  while (true) {
+    if (server && server->getConnectedCount() == 0) {
+      // Force a periodic advertising restart when not connected
+      startAdv();
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000)); // every 2 seconds
+  }
+}
+
+// =====================================================
 // setup / loop
-// =========================
+// =====================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin(PRESSURE_SDA_PIN, PRESSURE_SCL_PIN);
@@ -381,24 +435,23 @@ void setup() {
     delay(1000);
   }
 
-  // LED shift register pins (kept from your original setup)
   pinMode(LED_SDA_IO, OUTPUT);
   pinMode(LED_SHCP_IO, OUTPUT);
   pinMode(LED_STCP_IO, OUTPUT);
 
-  // Create queue
   data_queue = xQueueCreate(1000, sizeof(sensor_data));
 
-  // BLE init (Sensor advertises, Gateway connects)
   bleSetup();
 
-  // Create tasks
   xTaskCreatePinnedToCore(sensorTask, "SensorTask", 8192, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(bleSenderTask, "BLESenderTask", 8192, NULL, 1, NULL, 0);
+
+  // Low priority watchdog to keep advertising alive
+  xTaskCreatePinnedToCore(advWatchdogTask, "AdvWatchdog", 4096, NULL, 0, NULL, 0);
 
   delay(500);
 }
 
 void loop() {
-  // Empty: work is done in FreeRTOS tasks
+  // Work is done in FreeRTOS tasks
 }
