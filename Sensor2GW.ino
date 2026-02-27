@@ -399,8 +399,8 @@ void bleSenderTask(void *parameter) {
     bool ok = sendPackageToGateway(jsonBuffer, strlen(jsonBuffer));
     if (ok) has_pending = false;
 
-    // 1Hz is enough and improves stability in weak-signal environments
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // 4Hz is enough and improves stability in weak-signal environments
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 
