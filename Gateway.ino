@@ -23,6 +23,9 @@ static NimBLEAdvertisedDevice* g_found = nullptr;
 static NimBLEClient* g_client = nullptr;
 static NimBLERemoteCharacteristic* g_chr = nullptr;
 
+static unsigned long g_lastScanLogMs = 0;
+static const unsigned long SCAN_LOG_INTERVAL_MS = 5000;  // print at most once per 5s
+
 // ===== Batch buffer (8 samples per POST) =====
 static const size_t CHUNK = 8;
 static String g_buf[CHUNK];
@@ -175,7 +178,11 @@ static ScanCallbacks g_scanCb;
 
 // Start scanning for a given number of seconds (KEEP your existing behavior)
 void bleStartScan(uint32_t seconds = 5) {
-  Serial.printf("[GW] BLE scanning (%us)...\n", seconds);
+  unsigned long now = millis();
+  if (now - g_lastScanLogMs >= SCAN_LOG_INTERVAL_MS) {
+    Serial.printf("[GW] BLE scanning (%us)...\n", seconds);
+    g_lastScanLogMs = now;
+  }
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&g_scanCb, false);
   scan->setInterval(45);
@@ -265,8 +272,8 @@ void loop() {
   // Not connected yet: scan -> connect (KEEP)
   if (!g_client || !g_client->isConnected() || !g_chr) {
     if (g_found) bleConnectAndGetChar();
-    else bleStartScan(5);
-    delay(50);
+    else bleStartScan(2);
+    delay(10);
     return;
   }
 
@@ -277,16 +284,16 @@ void loop() {
   } catch (...) {
     Serial.println("[GW] readValue exception -> reset BLE and rescan");
     bleReset();
-    bleStartScan(5);
-    delay(200);
+    bleStartScan(2);
+    delay(50);
     return;
   }
 
   if (v.empty()) {
     Serial.println("[GW] BLE read empty -> reset BLE and rescan");
     bleReset();
-    bleStartScan(5);
-    delay(200);
+    bleStartScan(2);
+    delay(50);
     return;
   }
 
@@ -311,7 +318,7 @@ void loop() {
 
   if (clean.length() == 0) {
     Serial.println("[GW] CLEAN empty -> skip");
-    delay(200);
+    delay(50);
     return;
   }
 
@@ -319,7 +326,7 @@ void loop() {
   String oneObj;
   if (!normalizeOneSample(clean, oneObj)) {
     Serial.println("[GW] normalizeOneSample failed");
-    delay(200);
+    delay(50);
     return;
   }
 
@@ -344,7 +351,7 @@ void loop() {
   String postBody;
   if (!buildPostArrayFromBuffer(postBody)) {
     Serial.println("[GW] buildPostArrayFromBuffer failed (keep buffer and retry)");
-    delay(200);
+    delay(50);
     return;
   }
 
@@ -359,5 +366,5 @@ void loop() {
     Serial.println("[GW] POST failed -> keep buffer for retry");
   }
 
-  delay(1000); // keep your original pacing
+  delay(200); // keep your original pacing
 }
